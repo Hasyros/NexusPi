@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NexusPi</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <h1>NEXUS<b>PI</b></h1>
+        <span class="ver">v0.1 · control deck</span>
+      </div>
+      <div class="statusline" id="statusline">
+        <span class="dot">●</span> liaison établie<br>
+        <span id="modcount">— modules</span>
+      </div>
+    </header>
+
+    <div class="labbar">
+      <div class="txt">
+        <b>LAB MODE</b> — déverrouille les actions actives (émission/injection).
+        À n'utiliser que sur <b>tes propres réseaux</b>.
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="labtoggle" />
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="labwarn" id="labwarn">
+      ⚠ LAB MODE ACTIF — les actions d'émission sont déverrouillées. Toute opération est sous ta responsabilité.
+    </div>
+
+    <div class="grid" id="grid"></div>
+
+    <section class="panel" id="panel">
+      <div class="phead">
+        <span class="ico" id="pico"></span>
+        <h2 id="ptitle"></h2>
+        <span class="close" id="pclose">✕</span>
+      </div>
+      <div id="phases"></div>
+      <div class="console-wrap">
+        <button id="copybtn" onclick="copyConsoleLogs()" title="Copier les logs">📋 Copier</button>
+        <div class="console" id="console">en attente…</div>
+      </div>
+    </section>
+  </div>
+
+  <div id="clients-badge">
+    <span>📡</span>
+    <span id="clients-count">0</span> client(s)
+  </div>
+
+  <div id="stopbtn" class="stop-btn" onclick="stopCurrentTask()">
+    <span class="icn">⛔</span>
+    <span class="lbl">ARRÊTER</span>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
