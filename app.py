@@ -54,13 +54,19 @@ def run_action(module_id: str, action_id: str, req: RunRequest):
 
     # Garde-fou serveur : action lab_gated requiert lab_mode=True
     action = next((a for a in module.actions() if a.id == action_id), None)
-    if action is None:
-        return JSONResponse({"ok": False, "error": "action inconnue"}, status_code=404)
-    if action.lab_gated and not req.lab_mode:
+    if action is not None and action.lab_gated and not req.lab_mode:
         return JSONResponse(
             {"ok": False, "error": "action verrouillée : activez le Lab mode."},
             status_code=403,
         )
+
+    # Actions utilitaires (rename_signal, delete_signal…) : synchrones,
+    # pas dans actions() mais gérées par module.run()
+    if action is None:
+        result = module.run(action_id, req.params)
+        if result.get("error") == f"action '{action_id}' inconnue":
+            return JSONResponse(result, status_code=404)
+        return result
 
     task = run_in_background(
         f"{module_id}.{action_id}",

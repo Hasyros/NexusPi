@@ -1,68 +1,172 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NexusPi</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css" />
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
-  <div class="wrap">
-    <header>
-      <div class="brand">
-        <h1>NEXUS<b>PI</b></h1>
-        <span class="ver">v0.1 · control deck</span>
-      </div>
-      <div class="statusline" id="statusline">
-        <span class="dot">●</span> liaison établie<br>
-        <span id="modcount">— modules</span>
-      </div>
-    </header>
+<div class="app">
 
-    <div class="labbar">
-      <div class="txt">
-        <b>LAB MODE</b> — déverrouille les actions actives (émission/injection).
-        À n'utiliser que sur <b>tes propres réseaux</b>.
+  <!-- ====== TOP BAR ====== -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="glyph">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#ffb000" stroke-width="2" stroke-linecap="round">
+          <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
+          <circle cx="12" cy="12" r="3" fill="#ffb000" stroke="none"/>
+          <path d="M5 5l3 3M16 16l3 3M19 5l-3 3M8 16l-3 3" opacity=".5"/>
+        </svg>
       </div>
-      <label class="switch">
-        <input type="checkbox" id="labtoggle" />
-        <span class="slider"></span>
-      </label>
+      <div>
+        <div class="name">Nexus<b>Pi</b></div>
+        <div class="tag">RED TEAM TOOLKIT</div>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="statpills">
+      <div class="pill link-ok" id="pill-link">
+        <span class="dot"></span>
+        <span class="lbl">LINK</span>
+        <span class="val" id="link-val">...</span>
+      </div>
+      <div class="pill hide-m" id="pill-modules">
+        <span class="lbl">MODULES</span>
+        <span class="val" id="mod-count-pill">-</span>
+      </div>
+      <div class="pill hide-m lab-indicator" id="lab-indicator" style="display:none">
+        <span class="val" style="color:var(--red)">LAB ARME</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ====== SIDEBAR ====== -->
+  <nav class="nav" id="sidebar">
+    <div class="group-lbl">CONSOLE</div>
+    <div class="navbtn active" data-view="dashboard">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+      Dashboard
     </div>
 
-    <div class="labwarn" id="labwarn">
-      ⚠ LAB MODE ACTIF — les actions d'émission sont déverrouillées. Toute opération est sous ta responsabilité.
+    <div class="group-lbl">MODULES</div>
+    <div id="nav-modules"></div>
+
+    <div class="group-lbl">DONNEES</div>
+    <div class="navbtn" data-view="captures">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+      Captures
+    </div>
+    <div class="navbtn" data-view="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/></svg>
+      Reglages
     </div>
 
-    <div class="grid" id="grid"></div>
+    <div class="device-card">
+      <div class="row"><span class="k">DEVICE</span><span class="v">RPi 3B+</span></div>
+      <div class="row"><span class="k">OS</span><span class="v">Kali ARM</span></div>
+      <div class="row"><span class="k">MODE</span><span class="v warm" id="globalLab">STANDARD</span></div>
+    </div>
+  </nav>
 
-    <section class="panel" id="panel">
-      <div class="phead">
-        <span class="ico" id="pico"></span>
-        <h2 id="ptitle"></h2>
-        <span class="close" id="pclose">✕</span>
+  <!-- ====== MAIN ====== -->
+  <main class="main">
+
+    <!-- DASHBOARD -->
+    <section class="view active" id="view-dashboard">
+      <div class="view-head">
+        <h1>Dashboard</h1>
+        <span class="sub">Etat de l'appareil et des modules</span>
+        <div class="he-actions">
+          <button class="btn" onclick="load()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-3-6.7M21 4v4h-4"/></svg>Rafraichir
+          </button>
+        </div>
       </div>
-      <div id="phases"></div>
-      <div class="console-wrap">
-        <button id="copybtn" onclick="copyConsoleLogs()" title="Copier les logs">📋 Copier</button>
-        <div class="console" id="console">en attente…</div>
+      <div class="statrow" id="dash-stats"></div>
+      <div class="grid dash-cols">
+        <div class="grid mod-grid" id="dash-grid"></div>
+        <div class="panel" style="align-self:start" id="dash-activity">
+          <div class="panel-h">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg></span>
+            <h3>Activite recente</h3>
+          </div>
+          <div class="panel-b">
+            <div style="color:var(--txt-faint);font:500 11px var(--mono);text-align:center;padding:20px 0">
+              Les actions executees apparaitront ici
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="note" style="margin-top:18px">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9l-8 13.4A2 2 0 004 20h16a2 2 0 001.7-2.7l-8-13.4a2 2 0 00-3.4 0z"/></svg>
+        <span>Usage strictement educatif et tests autorises. Emissions RF dans le cadre ARCEP ; acces non autorise = delit (art. 323-1 Code penal). Les actions <b style="color:var(--red)">LAB</b> sont verrouillees par defaut.</span>
       </div>
     </section>
-  </div>
 
-  <div id="clients-badge">
-    <span>📡</span>
-    <span id="clients-count">0</span> client(s)
-  </div>
+    <!-- Vues modules (generees dynamiquement par JS) -->
+    <div id="module-views"></div>
 
-  <div id="stopbtn" class="stop-btn" onclick="stopCurrentTask()">
-    <span class="icn">⛔</span>
-    <span class="lbl">ARRÊTER</span>
-  </div>
+    <!-- CAPTURES -->
+    <section class="view" id="view-captures">
+      <div class="view-head">
+        <h1>Captures</h1>
+        <span class="sub">fichiers enregistres</span>
+      </div>
+      <div id="captures-content"></div>
+    </section>
 
-  <script src="/static/app.js"></script>
+    <!-- REGLAGES -->
+    <section class="view" id="view-settings">
+      <div class="view-head"><h1>Reglages</h1><span class="sub">appareil & securite</span></div>
+      <div class="settings-grid">
+        <div class="panel">
+          <div class="panel-h">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01"/><circle cx="12" cy="12" r="9"/></svg></span>
+            <h3>Lab Mode</h3>
+          </div>
+          <div class="panel-b">
+            <div class="setting-row">
+              <div class="sr-main">
+                <div class="sr-t">Mode laboratoire</div>
+                <div class="sr-d">Deverrouille les actions actives (emission RF, injection). Uniquement sur tes propres reseaux et equipements.</div>
+              </div>
+              <span class="toggle red"><input type="checkbox" id="labtoggle"><label for="labtoggle"></label></span>
+            </div>
+            <div class="labwarn" id="labwarn">MODE LAB ACTIF - les actions d'emission sont deverrouillees. Toute operation sous ta responsabilite.</div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-h">
+            <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12a10 10 0 0114 0"/></svg></span>
+            <h3>Connexion</h3>
+          </div>
+          <div class="panel-b">
+            <div class="setting-row">
+              <div class="sr-main">
+                <div class="sr-t">Liaison Pi - Client</div>
+                <div class="sr-d">Ethernet ICS - partage de connexion USB</div>
+              </div>
+              <span class="status-dot s-on"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- MOBILE NAV -->
+  <nav class="mobnav" id="mobnav"></nav>
+
+</div>
+
+<!-- Badge clients connectes -->
+<div id="clients-badge"></div>
+
+<script src="/static/app.js?v=7"></script>
 </body>
 </html>

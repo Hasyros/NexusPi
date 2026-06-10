@@ -41,6 +41,7 @@ class Action:
     phase: str = "passive"
     lab_gated: bool = False      # nécessite l'activation du "lab mode"
     description: str = ""
+    hint: str = ""               # exemple d'utilisation affiché sous la description
     params: List[Dict[str, Any]] = field(default_factory=list)  # schéma inputs
 
     def __post_init__(self):
